@@ -1,0 +1,77 @@
+name: Generate clips
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * *"   # daily; change as needed
+
+concurrency:
+  group: pipeline            # shared with post.yml so the database is never edited twice at once
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  clip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      CLAUDE_MODEL: ${{ vars.CLAUDE_MODEL || 'claude-sonnet-5-5' }}
+      CAMPAIGN_LIST_URLS: ${{ vars.CAMPAIGN_LIST_URLS }}
+      CLIPS_PER_SOURCE: ${{ vars.CLIPS_PER_SOURCE || '8' }}
+      WHISPER_MODEL: ${{ vars.WHISPER_MODEL || 'small' }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install FFmpeg and Python packages
+        run: |
+          sudo apt-get update && sudo apt-get install -y ffmpeg
+          pip install -r requirements.txt
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: whisper-${{ vars.WHISPER_MODEL || 'small' }}
+
+      - name: Write yt-dlp cookies (optional)
+        env:
+          YTDLP_COOKIES: ${{ secrets.YTDLP_COOKIES }}
+        run: |
+          if [ -n "$YTDLP_COOKIES" ]; then
+            printf '%s' "$YTDLP_COOKIES" > "$RUNNER_TEMP/cookies.txt"
+            echo "YTDLP_COOKIES_FILE=$RUNNER_TEMP/cookies.txt" >> "$GITHUB_ENV"
+          fi
+
+      - name: Discover campaigns and read their terms
+        run: python main.py discover
+
+      - name: Download sources and generate clips
+        run: python main.py clip
+
+      - name: Store new clips in the "clips" release
+        run: |
+          gh release view clips >/dev/null 2>&1 || \
+            gh release create clips --title "Clip queue" --notes "Storage for generated clips" --latest=false
+          shopt -s nullglob
+          files=(data/clips/*.mp4)
+          if [ ${#files[@]} -gt 0 ]; then
+            gh release upload clips "${files[@]}" --clobber
+          fi
+
+      - name: Save pipeline state
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/pipeline.db
+          if ! git diff --cached --quiet; then
+            git commit -m "Update pipeline state (clips)"
+            git push
+          fi
